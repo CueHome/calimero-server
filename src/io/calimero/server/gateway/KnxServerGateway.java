@@ -2224,9 +2224,12 @@ public class KnxServerGateway implements Runnable
 			ldataEx.setHopCount(count);
 			return msg;
 		}
-		return new CEMILData(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
-				msg.getPayload(), msg.getPriority(), msg.isRepetition(), count);
-	}
+		return payload.length > 16
+           ? new CEMILDataEx(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
+              payload, msg.getPriority(), msg.isRepetition(), count)
+           : new CEMILData(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
+              payload, msg.getPriority(), msg.isRepetition(), count);
+    }
 
 	// if we can not transmit for 5 seconds, we assume some network fault
 	private synchronized void setNetworkState(final int objectInstance, final boolean knxNetwork, final boolean faulty)
