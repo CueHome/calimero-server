@@ -89,7 +89,6 @@ final class RoutingService extends UdpServiceLooper
 		RoutingServiceHandler(final InetAddress mcGroup, final String name) {
 			super(mcGroup);
 			ctrlEndpt = new InetSocketAddress(mcGroup, DEFAULT_PORT);
-			dataEndpt = ctrlEndpt;
 			logger = LogService.getLogger("io.calimero.server.knxnetip." + name);
 			executor = new FifoSequentialExecutor(name + " task queue", logger);
 		}
