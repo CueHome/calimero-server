@@ -2209,31 +2209,34 @@ public class KnxServerGateway implements Runnable
 		}
 	}
 
-	// returns null to indicate a discarded frame
-   private static CEMILData adjustHopCount(final CEMILData msg)
-   {
-    if (msg.isSystemBroadcast())
-        return msg;
-    if (msg.getHopCount() == 0)
-        return msg;
+	// Cue deviation from upstream -- behaviour pinned by KnxServerGatewayHopCountTest, rationale and open
+	// defects in docs/knx/HOP-COUNT-PATCH.md. Unlike upstream this never returns null, so the "send == null"
+	// guards at the five call sites are unreachable. Do not "tidy" this method during a rebase without
+	// reading that document first.
+	private static CEMILData adjustHopCount(final CEMILData msg)
+	{
+		if (msg.isSystemBroadcast())
+			return msg;
+		if (msg.getHopCount() == 0)
+			return msg;
 
-    final int count = msg.getHopCount() - 1;
+		final int count = msg.getHopCount() - 1;
 
-    if (msg instanceof final CEMILDataEx ex) {
-        // If this frame is already extended, preserve extended type
-        return new CEMILDataEx(ex.getMessageCode(), ex.getSource(), ex.getDestination(),
-                ex.getPayload(), ex.getPriority(), ex.isRepetition(), count);
-    }
+		if (msg instanceof final CEMILDataEx ex) {
+			// If this frame is already extended, preserve extended type
+			return new CEMILDataEx(ex.getMessageCode(), ex.getSource(), ex.getDestination(),
+					ex.getPayload(), ex.getPriority(), ex.isRepetition(), count);
+		}
 
-    final byte[] payload = msg.getPayload();
+		final byte[] payload = msg.getPayload();
 
-    // If payload is long, do NOT rebuild as standard frame
-    return payload.length > 16
-            ? new CEMILDataEx(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
-                    payload, msg.getPriority(), msg.isRepetition(), count)
-            : new CEMILData(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
-                    payload, msg.getPriority(), msg.isRepetition(), count);
-    }
+		// If payload is long, do NOT rebuild as standard frame
+		return payload.length > 16
+				? new CEMILDataEx(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
+						payload, msg.getPriority(), msg.isRepetition(), count)
+				: new CEMILData(msg.getMessageCode(), msg.getSource(), msg.getDestination(),
+						payload, msg.getPriority(), msg.isRepetition(), count);
+	}
 
 	// if we can not transmit for 5 seconds, we assume some network fault
 	private synchronized void setNetworkState(final int objectInstance, final boolean knxNetwork, final boolean faulty)
