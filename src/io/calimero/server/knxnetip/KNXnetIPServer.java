@@ -71,6 +71,7 @@ import io.calimero.DeviceDescriptor.DD0;
 import io.calimero.IndividualAddress;
 import io.calimero.KNXFormatException;
 import io.calimero.KnxRuntimeException;
+import io.calimero.server.NetworkInterfaceResolver;
 import io.calimero.ReturnCode;
 import io.calimero.datapoint.Datapoint;
 import io.calimero.device.BaseKnxDevice;
@@ -179,6 +180,11 @@ public class KNXnetIPServer
 	private LooperTask discovery;
 	private NetworkInterface[] outgoingIf;
 	private NetworkInterface[] discoveryIfs;
+	// java.net.NetworkInterface is a snapshot: an instance resolved at startup keeps reporting the addresses it
+	// had then. Discovery therefore keeps the configured *names* and re-resolves on every LooperTask attempt,
+	// so an interface that disappears and returns is picked up instead of being advertised stale forever.
+	private String outgoingIfNames;
+	private String discoveryIfNames;
 
 	// KNX endpoint and connection stuff
 
@@ -574,8 +580,14 @@ public class KNXnetIPServer
 					startDiscoveryService(outgoingIf, discoveryIfs, -1);
 			}
 			case OPTION_ROUTING_LOOPBACK     -> multicastLoopback = Boolean.parseBoolean(value);
-			case OPTION_DISCOVERY_INTERFACES -> discoveryIfs = parseNetworkInterfaces(optionKey, value);
-			case OPTION_OUTGOING_INTERFACE   -> outgoingIf = parseNetworkInterfaces(optionKey, value);
+			case OPTION_DISCOVERY_INTERFACES -> {
+				discoveryIfNames = value;
+				discoveryIfs = parseNetworkInterfaces(optionKey, value);
+			}
+			case OPTION_OUTGOING_INTERFACE   -> {
+				outgoingIfNames = value;
+				outgoingIf = parseNetworkInterfaces(optionKey, value);
+			}
 			default -> logger.log(WARNING, "option \"" + optionKey + "\" not supported or unknown");
 		}
 	}
@@ -996,9 +1008,54 @@ public class KNXnetIPServer
 			if (!runDiscovery)
 				return;
 		}
-		final Supplier<UdpServiceLooper> builder = () -> new DiscoveryService(this, outgoing, listen);
+		final String outgoingNames = outgoingIfNames;
+		final String listenNames = discoveryIfNames;
+		final Supplier<UdpServiceLooper> builder = () -> new DiscoveryService(this,
+				resolveDiscoveryInterfaces(OPTION_OUTGOING_INTERFACE, outgoingNames, outgoing),
+				resolveDiscoveryInterfaces(OPTION_DISCOVERY_INTERFACES, listenNames, listen));
 		discovery = new LooperTask(this, serverName + " discovery endpoint", retryAttempts, builder);
 		LooperTask.scheduleWithRetry(discovery);
+	}
+
+	/**
+	 * Re-resolve configured discovery interface names on each attempt, rather than reusing snapshots taken at
+	 * startup.
+	 * <p>
+	 * An empty array means "every interface" to {@code DiscoveryService}, so it must never be produced by a
+	 * failed lookup of a named interface: under host networking that would silently join {@code docker0} and
+	 * every {@code veth}, advertising the server on interfaces it was explicitly configured to stay off.
+	 * Named interfaces that are missing are logged and skipped; if that leaves nothing to join, this throws so
+	 * the task retries rather than falling back to everything. Discovery failing this way does not affect the
+	 * control endpoint -- they are separate tasks.
+	 *
+	 * @param configured the configured value; {@code null} = default, {@code "all"} = every interface
+	 * @param fallback the interfaces resolved when the option was set, used when no names were configured
+	 */
+	private NetworkInterface[] resolveDiscoveryInterfaces(final String option, final String configured,
+		final NetworkInterface[] fallback)
+	{
+		if (configured == null || configured.equals("all"))
+			return fallback;
+		final List<NetworkInterface> resolved = new ArrayList<>();
+		final List<String> missing = new ArrayList<>();
+		for (final String raw : configured.split(",")) {
+			final String ifname = raw.trim();
+			if (ifname.isEmpty())
+				continue;
+			if (NetworkInterfaceResolver.isAny(ifname) || ifname.equals("default"))
+				return fallback;
+			final NetworkInterface nif = getNetworkInterfaceByName(option, ifname);
+			if (nif != null)
+				resolved.add(nif);
+			else
+				missing.add(ifname);
+		}
+		if (!missing.isEmpty())
+			logger.log(ERROR, "option {0}: skipping network interface(s) {1} - not present", option, missing);
+		if (resolved.isEmpty())
+			throw new KnxRuntimeException("option " + option + ": none of the configured network interfaces "
+					+ missing + " are present; not joining every interface instead");
+		return resolved.toArray(new NetworkInterface[0]);
 	}
 
 	private void stopDiscoveryService()

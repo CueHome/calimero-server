@@ -241,7 +241,9 @@ public class Launcher implements Runnable, AutoCloseable
 				throw new KNXIllegalArgumentException("with routing activated, reusing control endpoint is not allowed");
 			final boolean monitor = Boolean.parseBoolean(r.getAttributeValue(null, "networkMonitoring"));
 			final int port = attr(r, XmlConfiguration.attrUdpPort).map(Integer::parseUnsignedInt).orElse(3671);
-			final NetworkInterface netif = getNetIf(r);
+			// A named listen interface is kept as a name and resolved at bind, not here: a host-network
+			// container can legitimately start before the interface exists. See NetworkInterfaceResolver.
+			final String listenNetIfName = getNetIfName(r);
 
 			// look for a server keyfile
 			final var keyfile = attr(r, "keyfile").map(file -> appData.resolve(file)).map(XmlConfiguration::readKeyfile)
@@ -383,7 +385,7 @@ public class Launcher implements Runnable, AutoCloseable
 						else if (s.getMedium() == KNXMediumSettings.MEDIUM_RF)
 							((RFSettings) s).setDomainAddress(subnetDoA);
 
-						final String netifName = netif != null ? netif.getName() : "any";
+						final String netifName = listenNetIfName;
 						final String svcContName = subnetArgs.isEmpty() ? interfaceType + "-" + subnet : subnetArgs;
 						final boolean baosSupport = "baos".equals(msgFormat);
 						if (routing)
@@ -561,6 +563,21 @@ public class Launcher implements Runnable, AutoCloseable
 			while (r.nextTag() != XmlReader.END_ELEMENT && !r.getLocalName().equals("user"))
 				addresses.add(new IndividualAddress(r));
 			return addresses;
+		}
+
+		/**
+		 * The configured listen-interface name, verbatim and unresolved. Returns {@code "any"} when nothing is
+		 * configured. This never throws for an unknown name: the interface is resolved when the control endpoint
+		 * binds, so a container that starts before its interface exists waits instead of killing the JVM.
+		 */
+		private static String getNetIfName(final XmlReader r)
+		{
+			final String attr = attr(r, XmlConfiguration.attrListenNetIf).or(() -> attr(r, "netif")).orElse(null);
+			if (NetworkInterfaceResolver.isAny(attr))
+				return "any";
+			final String name = attr.trim();
+			NetworkInterfaceResolver.warnIfNotUsableYet(name);
+			return name;
 		}
 
 		private static NetworkInterface getNetIf(final XmlReader r)

@@ -126,6 +126,7 @@ import io.calimero.knxnetip.util.TunnelCRI;
 import io.calimero.knxnetip.util.TunnelingDib;
 import io.calimero.knxnetip.util.TunnelingDib.SlotStatus;
 import io.calimero.mgmt.PropertyAccess.PID;
+import io.calimero.server.NetworkInterfaceResolver;
 import io.calimero.server.knxnetip.DataEndpoint.ConnectionType;
 import io.calimero.server.knxnetip.SecureSessions.Session;
 
@@ -176,6 +177,10 @@ final class ControlEndpointService extends UdpServiceLooper
 
 
 	private volatile boolean inShutdown;
+
+	// address-change detection runs on the receive path too, so it has to be cheap and throttled
+	private static final Duration addressCheckInterval = Duration.ofSeconds(5);
+	private volatile long lastAddressCheck = System.nanoTime();
 
 
 	ControlEndpointService(final KNXnetIPServer server, final ServiceContainer sc)
@@ -300,8 +305,33 @@ final class ControlEndpointService extends UdpServiceLooper
 	}
 
 	@Override
+	public void onReceive(final InetSocketAddress source, final byte[] data, final int offset, final int length)
+			throws IOException
+	{
+		// the timeout path alone only fires when the endpoint is idle, and KNX keepalive traffic keeps it busy
+		// indefinitely -- which is why a DHCP address move used to stay invisible until the process restarted
+		checkAddressChange();
+		super.onReceive(source, data, offset, length);
+	}
+
+	@Override
 	protected void onTimeout()
 	{
+		checkAddressChange();
+		sessions.closeDormantSessions();
+	}
+
+	/**
+	 * Rebuild the control endpoint if the interface no longer carries the address we bound. Throttled, because
+	 * the receive path calls this for every datagram.
+	 */
+	private void checkAddressChange()
+	{
+		final long now = System.nanoTime();
+		final long last = lastAddressCheck;
+		if (now - last < addressCheckInterval.toNanos())
+			return;
+		lastAddressCheck = now;
 		try {
 			final InetAddress ip = Optional.ofNullable(((InetSocketAddress) s.getLocalSocketAddress()))
 					.map(InetSocketAddress::getAddress).orElse(InetAddress.getByAddress(new byte[4]));
@@ -309,11 +339,15 @@ final class ControlEndpointService extends UdpServiceLooper
 			if (!addresses.contains(ip)) {
 				logger.log(WARNING, "{0} control endpoint: interface {1} updated its IP address from {2} to {3}",
 						svcCont.getName(), svcCont.networkInterface(), ip.getHostAddress(), addresses);
+				// Close THIS endpoint only. Never LooperTask.quit(): that cancels the scheduled future, and a
+				// scheduleWithFixedDelay cancellation is permanent -- the endpoint would never be rebuilt for
+				// the lifetime of the process, while cleanup() logs an ordinary "closed" line at INFO.
+				// LooperTask.cleanup() does not touch the future, so quitting the looper here lets the
+				// existing fixed-delay schedule construct a fresh ControlEndpointService ~10 s later.
 				quit();
 			}
 		}
 		catch (final IOException ignore) {}
-		sessions.closeDormantSessions();
 	}
 
 	ServiceContainer getServiceContainer()
@@ -716,19 +750,30 @@ final class ControlEndpointService extends UdpServiceLooper
 
 	private DatagramSocket createSocket()
 	{
-		InetAddress ip;
+		final String netif = svcCont.networkInterface();
+		// A named interface is awaited and bound explicitly. There is deliberately no wildcard fallback here:
+		// binding 0.0.0.0 would succeed, log a healthy start, and then publish an unroutable address in the
+		// search HPAI, the connect HPAI, the inherited data-endpoint socket and PID.CURRENT_IP_ADDRESS.
+		// Failing loudly instead lets LooperTask (maxRetries = -1) retry until the interface is really there.
+		final InetAddress ip = NetworkInterfaceResolver.awaitBindAddress(netif).orElse(anyLocalIPv4Address);
+
+		DatagramSocket s = null;
 		try {
-			final DatagramSocket s = new DatagramSocket(null);
+			s = new DatagramSocket(null);
 			// if we use the KNXnet/IP default port, we have to enable address reuse for a successful bind
 			if (svcCont.port() == KNXnetIPConnection.DEFAULT_PORT)
 				s.setReuseAddress(true);
-			ip = usableIpAddresses().findFirst().orElse(anyLocalIPv4Address);
 			s.bind(new InetSocketAddress(ip, svcCont.port()));
 			final var boundTo = new UdpEndpointAddress((InetSocketAddress) s.getLocalSocketAddress());
-			logger.log(TRACE, "{0} control endpoint bound to {1}", svcCont.getName(), boundTo);
+			logger.log(INFO, "{0} control endpoint bound to {1} (interface {2})", svcCont.getName(), boundTo,
+					netif);
 			return s;
 		}
 		catch (final SocketException e) {
+			// close before rethrowing: this path is retried every 10 s for the life of the process, so a
+			// leaked socket here is an unbounded file-descriptor leak rather than a one-off at startup
+			if (s != null)
+				s.close();
 			throw wrappedException(e);
 		}
 	}
@@ -758,11 +803,11 @@ final class ControlEndpointService extends UdpServiceLooper
 	}
 
 	private Stream<InetAddress> usableIpAddresses() throws SocketException {
-		final NetworkInterface netif = NetworkInterface.getByName(svcCont.networkInterface());
-		if (netif != null)
-			return netif.inetAddresses().filter(Inet4Address.class::isInstance);
-		if (!"any".equals(svcCont.networkInterface()))
-			return Stream.empty();
+		// one definition of "usable" and one definition of "any", shared with the bind path and the
+		// address-change check -- a second, weaker predicate here is what allowed a named interface to fall
+		// through to a wildcard bind
+		if (!NetworkInterfaceResolver.isAny(svcCont.networkInterface()))
+			return NetworkInterfaceResolver.usableAddresses(svcCont.networkInterface());
 
 		final var localHost = localHost().filter(Inet4Address.class::isInstance)
 				.filter(not(InetAddress::isLoopbackAddress));
