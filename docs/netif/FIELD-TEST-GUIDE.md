@@ -10,9 +10,14 @@
 > will simply reproduce today's crash loop and tell you nothing.
 > **Do not start until the branch is confirmed code-complete.**
 >
-> Gates run 2026-08-21 against what exists: **Red Team ISSUES FOUND (1 CRITICAL, 5 HIGH, 7 WARNING)**,
-> **Licence BLOCKED**. Both must clear, and both gates must be re-run after the remaining code lands, before
-> this handoff opens.
+> Gates run 2026-08-21 against what exists — **all three failed**: red team **ISSUES FOUND**
+> (1 CRITICAL, 5 HIGH, 7 WARNING) · licence **BLOCKED** · conformance **FAIL** (5 CRITICAL, 3 HIGH,
+> 4 WARNING) with `APPROVED FOR HUMAN TESTING: NO`. All must clear, and all three must be re-run after the
+> remaining code lands, before this handoff opens.
+>
+> There is also **no deployment documentation in the repo** — no Dockerfile, no compose file, and the
+> shipped sample config uses `netif="any"`, the opposite of the site setting. That has to be written before
+> a rig is worth booking.
 
 ---
 
@@ -53,6 +58,21 @@ docker logs -f --timestamps <container> 2>&1 | tee netif-test-$(date +%Y%m%d-%H%
 
 **Timestamps are mandatory** (`--timestamps`). Two of the three tests are scored on elapsed time, and a
 log without timestamps cannot be scored.
+
+> **You must raise the log level, or these tests cannot be scored at all.**
+> The line that reports the **bound address** is logged at `TRACE`, but the shipped
+> `resources/simplelogger.properties` sets `defaultLogLevel=info`. At the default level the only thing you
+> see is `… is up and running` — which prints happily for a wrong or wildcard bind.
+>
+> Worse: on a `0.0.0.0` bind the interface-name prefix **silently disappears** from that line, because the
+> reverse lookup on the wildcard address returns nothing. So the failure case looks like a slightly shorter
+> success line. Nothing else distinguishes them.
+>
+> Set `-Dorg.slf4j.simpleLogger.defaultLogLevel=trace` (or edit `simplelogger.properties`) before you start,
+> and confirm you can actually see a `control endpoint bound to …` line on a known-good boot. If you cannot
+> see that line, stop — you have no instrument, and every result below is unscoreable.
+>
+> Promoting that line to `INFO` is on the fix list. Until it lands, this workaround is mandatory.
 
 ---
 

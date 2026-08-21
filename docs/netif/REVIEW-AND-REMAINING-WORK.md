@@ -96,7 +96,7 @@ Check the pool size and report it. If it is single-threaded, say so and stop —
 ### C — address change: check on receive **and** timeout, 5 s, close and let the looper rebuild
 
 `onTimeout()` (`:303`–`:316`) already compares the bound IP against `usableIpAddresses()` and calls
-`quit()`. Two gaps: the looper timeout is **10 s** (`super(server, null, 512, 10000)`, `:267`) and
+`quit()`. Two gaps: the looper timeout is **10 s** (`super(server, null, 512, 10000)`, `:183`) and
 `onTimeout` only fires on **idle** — KNX keepalive traffic suppresses it indefinitely. That is why
 `192.168.0.221 → 192.168.1.73` stayed silent until process restart.
 
@@ -331,6 +331,72 @@ both receive and timeout in one window is harmless) · monotonic `nanoTime` (imm
 `currentTimeMillis` would have been a bug) · log flooding (~1.7 lines/min, field test 3 passes on this axis)
 · thread-safety across multiple service containers (no mutable static state) · no undeclared dependencies ·
 no interrupt-flag leak between tasks.
+
+---
+
+## 3d. Conformance validation — the wildcard reaches four places, not one
+
+The scoped conformance pass returned **FAIL: 5 CRITICAL, 3 HIGH, 4 WARNING**. It re-verified every line
+reference in this document against the branch and found **one error, now corrected above**: the
+`ServiceLooper` constructor call is at `ControlEndpointService.java:183`, not `:267`.
+
+### The `0.0.0.0` question is settled — bind the specific address
+
+A conformance rule elsewhere in the estate requires Docker containers to bind `('0.0.0.0', PORT)` and
+never a specific NIC IP. This dispatch prescribes the opposite. **Adjudicated in favour of this dispatch**,
+on two grounds read out of the code rather than argued from authority:
+
+1. **The rule's premise is a *bridge*-networking fact.** Its stated reason is that a NIC IP "may not exist
+   inside the container." Under `--network host` the container shares the host's namespace, so `end1` and
+   its address are directly visible and bindable. The premise is false here.
+2. **KNXnet/IP copies the socket's local address into the payload, and nothing rescues a wildcard.**
+   `HPAI.isRouteBack()` in core is `address.isAnyLocalAddress() && port == 0`. A wildcard bind yields
+   `0.0.0.0:`**`3671`** — port non-zero — so it is **not** route-back. Route-back is a client-side NAT
+   convention with no server-side counterpart. And `useNat` (`:421`) is set only from the **client's**
+   incoming HPAI, never from the server's bind address, so `HPAI.Nat` does not cover this either.
+
+**§1 of this dispatch understated the blast radius.** A wildcard bind propagates to **four** places, not one:
+
+| # | Path | Consequence |
+|---|---|---|
+| 1 | `:631` search-response HPAI | no NAT branch, no wildcard guard at all — ETS learns an unroutable endpoint |
+| 2 | `:1015`-`:1016` connect-response HPAI | `useNat` cannot save it |
+| 3 | `DataEndpointService.java:66` | data socket binds from `localCtrlEndpt.getLocalAddress()` — **the tunnel data HPAI inherits the wildcard** |
+| 4 | `:189`-`:197` | `PID.IP_ADDRESS` / `PID.CURRENT_IP_ADDRESS` published in DIBs and readable over device management |
+
+Verify all four are clean once B lands. Paths 3 and 4 were not named in the original prescription.
+
+### New required work
+
+| ID | Sev | Finding |
+|---|---|---|
+| **FD leak** | HIGH | `createSocket()` allocates at `:721` (`new DatagramSocket(null)`), and if `s.bind()` at `:726` throws, `:731`-`:732` rethrows **without closing it**. Harmless today because startup died anyway — but B makes this retry every ~10 s **forever**, turning a one-shot leak into an unbounded fd leak. The fix design creates this. Same pattern at `DataEndpointService.java:139`-`:146`. Use try-with-resources or close before rethrow. |
+| **Discovery over-advertises** | HIGH | `KNXnetIPServer.getNetworkInterfaceByName` (`:709`-`:722`) logs ERROR and returns `null` for an absent name; `parseNetworkInterfaces` (`:691`-`:706`) then yields an **empty array**; `DiscoveryService.joinOnInterfaces` (`:119`-`:121`) treats `length == 0` as *join on every interface*. Under host-net that is `docker0` and every `veth*`. A wrong `listenNetIf` does not fail — it **silently over-advertises**. The C-adjacent change must make the empty case explicit. Also `DiscoveryService.java:158` `throw Objects.requireNonNull(thrown)` NPEs when nothing had an IPv4, so the log shows a bare NPE instead of a diagnosis. |
+| **APIPA ordering** | HIGH | Compounds the link-local finding: `:725` `usableIpAddresses().findFirst()` takes the **first** IPv4 in unspecified order, so an interface holding both an APIPA address and a real lease can bind the wrong one. Selection must be deterministic, not `findFirst()`. |
+| **DOC-1** | CRITICAL | The repo has **no deployment documentation at all** — no Dockerfile, no compose file, nothing. `README.md:94` describes `netif` generically, and `resources/server-config.xml:9` ships `netif="any"`, the opposite of the site config. An installer handed a wrong `netif` has nothing to consult and no log line named to check. **Write this before a rig is scheduled.** |
+| **Bind line invisible** | WARNING | `:727` logs the bound address at **TRACE**, but `resources/simplelogger.properties:7` ships `defaultLogLevel=info`. The only visible line is `"… is up and running"`. Worse: on a wildcard bind `getByInetAddress(0.0.0.0)` returns null, so the interface prefix **silently vanishes** and the line reads `control endpoint 0.0.0.0:3671 is up and running`. Promote to INFO and name the interface explicitly. |
+| **Parse log level** | WARNING | Part A specifies INFO for an unresolvable name. A typo'd `netif` is a **permanent** config error driving an infinite retry cycle, indistinguishable at INFO from a NIC that is merely slow. Log WARNING, and emit a one-time line listing the interface names that **do** exist — that single line is what lets a field engineer fix a typo without a debugger. |
+| `appData` | WARNING | `Launcher.java:188` defaults it to `Path.of("")` — the container CWD — and `:219` derives `<serverName>-ios.xml` from it. With no `appData` set, that resolves inside the ephemeral container layer, not a mounted volume. |
+| BAOS port | WARNING | `:214` hardcodes `new InetSocketAddress(addr, 12004)` with no config knob; under host-net that claims port 12004 on the host. |
+
+### Two adjudications that reject changes — do not "fix" these
+
+- **Exponential backoff does not apply.** The standard requiring it is about per-command ACK retries into a
+  shared collision domain. `LooperTask` is a service-restart cadence for one process binding one socket —
+  no collision domain. Exponential backoff would actively defeat the ≤15 s rebind criterion by pushing
+  later recoveries into minutes. Keep the fixed 10 s.
+- **Throw-at-bind is the established pattern here, not a novelty.** `RoutingService.networkInterface()`
+  (`:308`-`:316`) **already** re-resolves by name on every `LooperTask` attempt and throws when the
+  interface is absent — exactly the shape B and the discovery change must adopt. Follow it.
+
+### One conformance recommendation is superseded — do not act on it
+
+The pass recommended pinning `calimero-core` to **`3.0-M1`**, reasoning that `ConnectionBase.dataEndpt`
+exists only there. **The observation is correct** — verified by `javap`: `dataEndpt` is present in `3.0-M1`
+and absent from both `3.0-M2` and `3.0-SNAPSHOT`. **The recommendation is still wrong.** It was reached
+statically, without a build; pinning M1 was measured and produces **200 compile errors**, because the rest
+of the tree has moved on with core. The fix stays as §3.2: delete `RoutingService.java:92` and remain on
+`3.0-SNAPSHOT`. This is also what upstream did.
 
 ---
 
